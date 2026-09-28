@@ -151,7 +151,7 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 			// operation completed successfully
 		case windows.ERROR_OPERATION_ABORTED:
 			// port may have been closed
-			return int(readed), &PortError{code: PortClosed, causedBy: err}
+			return int(readed), windowsIOError(err)
 		default:
 			// error happened
 			return int(readed), err
@@ -191,7 +191,14 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 		err = waitForOverlappedResult(handle, ev, &writed, true)
 	}
 	port.pendingIO.Done()
-	return int(writed), err
+	return int(writed), windowsIOError(err)
+}
+
+func windowsIOError(err error) error {
+	if errors.Is(err, windows.ERROR_OPERATION_ABORTED) {
+		return &PortError{code: PortClosed, causedBy: err}
+	}
+	return err
 }
 
 func (port *windowsPort) Drain() (err error) {

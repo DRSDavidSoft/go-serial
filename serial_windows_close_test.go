@@ -129,6 +129,14 @@ func TestWindowsClosePreservesHandleForRetryWhenCancellationFails(t *testing.T) 
 	}
 }
 
+func TestWindowsOperationAbortedMapsToPortClosed(t *testing.T) {
+	err := windowsIOError(windows.ERROR_OPERATION_ABORTED)
+	var portErr *PortError
+	if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+		t.Fatalf("error = %v, want PortClosed", err)
+	}
+}
+
 func connectedOverlappedPipe(t *testing.T) (windows.Handle, windows.Handle) {
 	t.Helper()
 	name, err := windows.UTF16PtrFromString(fmt.Sprintf(
