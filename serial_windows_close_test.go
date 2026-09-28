@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,9 +15,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func testWindowsPort(handle windows.Handle) *windowsPort {
+	port := &windowsPort{handle: handle}
+	port.liveHandle.Store(uintptr(handle))
+	return port
+}
+
 func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	server, client := connectedOverlappedPipe(t)
-	port := &windowsPort{handle: server}
+	port := testWindowsPort(server)
 	pending := make(chan struct{})
 	originalRead := readWindowsFile
 	readWindowsFile = func(
@@ -88,8 +96,255 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	}
 }
 
+func TestWindowsCloseCancelsReadBlockedInsideOverlappedIssuance(t *testing.T) {
+	const handle = windows.Handle(1)
+	port := testWindowsPort(handle)
+	readEntered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var releaseOnce sync.Once
+	var cancelCalls atomic.Int32
+	var closeCalls atomic.Int32
+	originalRead := readWindowsFile
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	readWindowsFile = func(
+		windows.Handle,
+		[]byte,
+		*uint32,
+		*windows.Overlapped,
+	) error {
+		close(readEntered)
+		<-releaseRead
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	cancelPendingIO = func(got windows.Handle, _ *windows.Overlapped) error {
+		if got != handle {
+			t.Errorf("CancelIoEx handle = %v, want %v", got, handle)
+		}
+		cancelCalls.Add(1)
+		releaseOnce.Do(func() { close(releaseRead) })
+		return nil
+	}
+	closeWindowsHandle = func(got windows.Handle) error {
+		if got != handle {
+			t.Errorf("CloseHandle handle = %v, want %v", got, handle)
+		}
+		closeCalls.Add(1)
+		return nil
+	}
+	defer func() {
+		readWindowsFile = originalRead
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := port.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile did not block inside overlapped issuance")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- port.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited on the issuance mutex before cancelling blocked ReadFile")
+	}
+	select {
+	case err := <-readDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("read error = %v, want PortClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked ReadFile did not return after Close cancellation")
+	}
+	if calls := cancelCalls.Load(); calls < 2 {
+		t.Fatalf("CancelIoEx calls = %d, want pre-lock and final cancellation", calls)
+	}
+	if calls := closeCalls.Load(); calls != 1 {
+		t.Fatalf("CloseHandle calls = %d, want 1", calls)
+	}
+}
+
+func TestWindowsCloseCancelsWriteBlockedInsideOverlappedIssuance(t *testing.T) {
+	const handle = windows.Handle(1)
+	port := testWindowsPort(handle)
+	writeEntered := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var releaseOnce sync.Once
+	var cancelCalls atomic.Int32
+	var closeCalls atomic.Int32
+	originalWrite := writeWindowsFile
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	writeWindowsFile = func(
+		windows.Handle,
+		[]byte,
+		*uint32,
+		*windows.Overlapped,
+	) error {
+		close(writeEntered)
+		<-releaseWrite
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	cancelPendingIO = func(got windows.Handle, _ *windows.Overlapped) error {
+		if got != handle {
+			t.Errorf("CancelIoEx handle = %v, want %v", got, handle)
+		}
+		cancelCalls.Add(1)
+		releaseOnce.Do(func() { close(releaseWrite) })
+		return nil
+	}
+	closeWindowsHandle = func(got windows.Handle) error {
+		if got != handle {
+			t.Errorf("CloseHandle handle = %v, want %v", got, handle)
+		}
+		closeCalls.Add(1)
+		return nil
+	}
+	defer func() {
+		writeWindowsFile = originalWrite
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := port.Write([]byte{1})
+		writeDone <- err
+	}()
+	select {
+	case <-writeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("WriteFile did not block inside overlapped issuance")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- port.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited on the issuance mutex before cancelling blocked WriteFile")
+	}
+	select {
+	case err := <-writeDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("write error = %v, want PortClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked WriteFile did not return after Close cancellation")
+	}
+	if calls := cancelCalls.Load(); calls < 2 {
+		t.Fatalf("CancelIoEx calls = %d, want pre-lock and final cancellation", calls)
+	}
+	if calls := closeCalls.Load(); calls != 1 {
+		t.Fatalf("CloseHandle calls = %d, want 1", calls)
+	}
+}
+
+func TestWindowsCloseBoundsBlockedIssuanceAndLaterRetries(t *testing.T) {
+	const handle = windows.Handle(1)
+	port := testWindowsPort(handle)
+	readEntered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var releaseOnce sync.Once
+	var allowCancellation atomic.Bool
+	var closeCalls atomic.Int32
+	originalRead := readWindowsFile
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	originalTimeout := closeIssueLockTimeout
+	originalDelay := closeIssueRetryDelay
+	readWindowsFile = func(
+		windows.Handle,
+		[]byte,
+		*uint32,
+		*windows.Overlapped,
+	) error {
+		close(readEntered)
+		<-releaseRead
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error {
+		if allowCancellation.Load() {
+			releaseOnce.Do(func() { close(releaseRead) })
+		}
+		return nil
+	}
+	closeWindowsHandle = func(windows.Handle) error {
+		closeCalls.Add(1)
+		return nil
+	}
+	closeIssueLockTimeout = 25 * time.Millisecond
+	closeIssueRetryDelay = time.Millisecond
+	defer func() {
+		readWindowsFile = originalRead
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+		closeIssueLockTimeout = originalTimeout
+		closeIssueRetryDelay = originalDelay
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := port.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile did not block inside overlapped issuance")
+	}
+
+	started := time.Now()
+	err := port.Close()
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("first Close error = %v, want bounded issuance timeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("first Close took %s, want bounded return", elapsed)
+	}
+	if got := windows.Handle(port.liveHandle.Load()); got != handle || port.handle != handle {
+		t.Fatalf("failed Close lost handle ownership: live=%v handle=%v want %v", got, port.handle, handle)
+	}
+	if calls := closeCalls.Load(); calls != 0 {
+		t.Fatalf("CloseHandle calls after issuance timeout = %d, want 0", calls)
+	}
+
+	allowCancellation.Store(true)
+	if err := port.Close(); err != nil {
+		t.Fatalf("retry Close: %v", err)
+	}
+	select {
+	case err := <-readDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("read error = %v, want PortClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked ReadFile did not return after retry Close")
+	}
+	if calls := closeCalls.Load(); calls != 1 {
+		t.Fatalf("CloseHandle calls after retry = %d, want 1", calls)
+	}
+}
+
 func TestWindowsCloseReleasesHandleBeforeJoiningDriverCancellation(t *testing.T) {
-	port := &windowsPort{handle: windows.Handle(1)}
+	port := testWindowsPort(windows.Handle(1))
 	readStarted := make(chan struct{})
 	handleClosed := make(chan struct{})
 	waiterSawClose := make(chan struct{})
@@ -186,7 +441,7 @@ func TestWindowsCloseReleasesHandleBeforeJoiningDriverCancellation(t *testing.T)
 }
 
 func TestWindowsCloseReleasesHandleBeforeJoiningDriverWriteCancellation(t *testing.T) {
-	port := &windowsPort{handle: windows.Handle(1)}
+	port := testWindowsPort(windows.Handle(1))
 	writeStarted := make(chan struct{})
 	handleClosed := make(chan struct{})
 	releaseWaiter := make(chan struct{})
@@ -274,7 +529,7 @@ func TestWindowsCloseReleasesHandleBeforeJoiningDriverWriteCancellation(t *testi
 
 func TestWindowsReadUsesNonblockingResultOnlyWhileHandleIsLive(t *testing.T) {
 	const handle = windows.Handle(1)
-	port := &windowsPort{handle: handle}
+	port := testWindowsPort(handle)
 	originalRead := readWindowsFile
 	originalEventWait := waitForOverlappedEvent
 	originalResultWait := waitForOverlappedResult
@@ -319,7 +574,7 @@ func TestWindowsReadUsesNonblockingResultOnlyWhileHandleIsLive(t *testing.T) {
 
 func TestWindowsCloseReturnsCancellationErrorAndLaterCloseRetries(t *testing.T) {
 	server, client := connectedOverlappedPipe(t)
-	port := &windowsPort{handle: server}
+	port := testWindowsPort(server)
 	cancelErr := windows.ERROR_ACCESS_DENIED
 	pending := make(chan struct{})
 	originalRead := readWindowsFile
@@ -424,8 +679,8 @@ func TestWindowsCloseReturnsCancellationErrorAndLaterCloseRetries(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("retry Close did not finish after cancellation succeeded")
 	}
-	if calls := closeCalls.Load(); cancelCalls != 2 || calls != 1 {
-		t.Fatalf("calls = cancel %d, close %d; want two cancellations and one close", cancelCalls, calls)
+	if calls := closeCalls.Load(); cancelCalls < 3 || calls != 1 {
+		t.Fatalf("calls = cancel %d, close %d; want failed pre-lock plus at least pre-lock/final retry cancellation and one close", cancelCalls, calls)
 	}
 	if port.handle != 0 {
 		t.Fatalf("handle = %v after completed close, want 0", port.handle)
