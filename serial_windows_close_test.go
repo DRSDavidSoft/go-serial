@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,8 +94,10 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 	originalWait := waitForOverlappedResult
 	originalCancel := cancelPendingIO
 	originalClose := closeWindowsHandle
+	originalBeforeWait := beforePendingIOWait
 	cancelCalls := 0
-	closeCalls := 0
+	var closeCalls atomic.Int32
+	waitingForIO := make(chan struct{})
 	waitForOverlappedResult = func(
 		handle windows.Handle,
 		overlapped *windows.Overlapped,
@@ -109,13 +112,15 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 		return cancelErr
 	}
 	closeWindowsHandle = func(handle windows.Handle) error {
-		closeCalls++
+		closeCalls.Add(1)
 		return errors.Join(originalClose(handle), closeErr)
 	}
+	beforePendingIOWait = func() { close(waitingForIO) }
 	defer func() {
 		waitForOverlappedResult = originalWait
 		cancelPendingIO = originalCancel
 		closeWindowsHandle = originalClose
+		beforePendingIOWait = originalBeforeWait
 	}()
 
 	readDone := make(chan error, 1)
@@ -133,13 +138,17 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- port.Close() }()
 	select {
+	case <-waitingForIO:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not reach the pending-I/O lifetime wait")
+	}
+	select {
 	case err := <-closeDone:
 		t.Fatalf("Close returned before failed-cancellation I/O completed: %v", err)
-	case <-time.After(100 * time.Millisecond):
-		// Required: Close keeps the handle and OVERLAPPED storage alive.
+	default:
 	}
-	if closeCalls != 0 {
-		t.Fatalf("CloseHandle calls before pending I/O completed = %d, want 0", closeCalls)
+	if calls := closeCalls.Load(); calls != 0 {
+		t.Fatalf("CloseHandle calls before pending I/O completed = %d, want 0", calls)
 	}
 
 	data := []byte{0xA5}
@@ -168,8 +177,8 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 	if !errors.Is(err, cancelErr) || !errors.Is(err, closeErr) {
 		t.Fatalf("close error = %v, want joined cancellation and close errors", err)
 	}
-	if cancelCalls != 1 || closeCalls != 1 {
-		t.Fatalf("calls = cancel %d, close %d; want one each", cancelCalls, closeCalls)
+	if calls := closeCalls.Load(); cancelCalls != 1 || calls != 1 {
+		t.Fatalf("calls = cancel %d, close %d; want one each", cancelCalls, calls)
 	}
 	if port.handle != 0 {
 		t.Fatalf("handle = %v after completed close, want 0", port.handle)
