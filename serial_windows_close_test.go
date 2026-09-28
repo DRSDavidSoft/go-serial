@@ -84,6 +84,42 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	}
 }
 
+func TestWindowsCloseAttemptsHandleReleaseWhenCancellationFails(t *testing.T) {
+	cancelErr := windows.ERROR_ACCESS_DENIED
+	closeErr := windows.ERROR_INVALID_FUNCTION
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	cancelCalls := 0
+	closeCalls := 0
+	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error {
+		cancelCalls++
+		return cancelErr
+	}
+	closeWindowsHandle = func(windows.Handle) error {
+		closeCalls++
+		return closeErr
+	}
+	defer func() {
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+	}()
+
+	port := &windowsPort{handle: windows.Handle(123)}
+	err := port.Close()
+	if !errors.Is(err, cancelErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("close error = %v, want joined cancellation and close errors", err)
+	}
+	if cancelCalls != 1 || closeCalls != 1 {
+		t.Fatalf("calls = cancel %d, close %d; want one each", cancelCalls, closeCalls)
+	}
+	if port.handle != 0 {
+		t.Fatalf("handle = %v after close failure, want 0", port.handle)
+	}
+	if repeatedErr := port.Close(); repeatedErr != err {
+		t.Fatalf("repeated close error = %v, want stored result %v", repeatedErr, err)
+	}
+}
+
 func connectedOverlappedPipe(t *testing.T) (windows.Handle, windows.Handle) {
 	t.Helper()
 	name, err := windows.UTF16PtrFromString(fmt.Sprintf(

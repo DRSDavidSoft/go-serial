@@ -37,7 +37,11 @@ type windowsPort struct {
 	closeErr   error
 }
 
-var waitForOverlappedResult = windows.GetOverlappedResult
+var (
+	waitForOverlappedResult = windows.GetOverlappedResult
+	cancelPendingIO         = windows.CancelIoEx
+	closeWindowsHandle      = windows.CloseHandle
+)
 
 func nativeGetPortsList() ([]string, error) {
 	key, err := registry.OpenKey(windows.HKEY_LOCAL_MACHINE, `HARDWARE\DEVICEMAP\SERIALCOMM\`, windows.KEY_READ)
@@ -93,7 +97,7 @@ func (port *windowsPort) Close() error {
 	handle := port.handle
 	port.handle = 0
 	port.closeDone = make(chan struct{})
-	cancelErr := windows.CancelIoEx(handle, nil)
+	cancelErr := cancelPendingIO(handle, nil)
 	if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
 		// No operation was pending. This is the normal idle-close case.
 		cancelErr = nil
@@ -106,7 +110,10 @@ func (port *windowsPort) Close() error {
 		// kernel handle before every in-flight ReadFile/WriteFile has returned.
 		port.pendingIO.Wait()
 	}
-	closeErr := windows.CloseHandle(handle)
+	// If cancellation itself failed, waiting could block forever because the
+	// driver may never complete the operation. CloseHandle is still mandatory:
+	// it is the final release attempt, and both errors are returned to the caller.
+	closeErr := closeWindowsHandle(handle)
 	result := errors.Join(cancelErr, closeErr)
 
 	port.mu.Lock()
