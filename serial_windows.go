@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,7 +32,10 @@ import (
 
 type windowsPort struct {
 	mu         sync.Mutex
+	closeMu    sync.Mutex
 	handle     windows.Handle
+	liveHandle atomic.Uintptr
+	closing    atomic.Bool
 	hasTimeout bool
 	pendingIO  sync.WaitGroup
 	closeDone  chan struct{}
@@ -45,6 +49,8 @@ var (
 	closeWindowsHandle      = windows.CloseHandle
 	readWindowsFile         = windows.ReadFile
 	writeWindowsFile        = windows.WriteFile
+	closeIssueLockTimeout   = 2 * time.Second
+	closeIssueRetryDelay    = time.Millisecond
 )
 
 func nativeGetPortsList() ([]string, error) {
@@ -78,19 +84,50 @@ func nativeGetPortsList() ([]string, error) {
 }
 
 func (port *windowsPort) Close() error {
-	port.mu.Lock()
-	if port.handle == 0 {
-		done := port.closeDone
-		err := port.closeErr
-		port.mu.Unlock()
-		if done == nil {
+	// Only one closer may use the lock-free published handle. Without this
+	// independent serialization, a second Close could load the handle just
+	// before the first CloseHandle and then call CancelIoEx after Windows reused
+	// that numeric value for an unrelated object.
+	port.closeMu.Lock()
+	defer port.closeMu.Unlock()
+
+	port.closing.Store(true)
+	deadline := time.Now().Add(closeIssueLockTimeout)
+	var handle windows.Handle
+	for {
+		handle = windows.Handle(port.liveHandle.Load())
+		if handle == 0 {
+			port.mu.Lock()
+			return port.waitForConcurrentCloseLocked()
+		}
+
+		// A broken USB serial driver may block inside the nominally-overlapped
+		// ReadFile/WriteFile call while that caller owns mu. Cancellation must not
+		// need the same lock or Close can never reach CloseHandle. The published
+		// handle remains open and therefore cannot be reused while this loop asks
+		// Windows to cancel and waits to acquire the issuance lock. Retrying also
+		// closes the narrow window where an operation registered but had not yet
+		// entered the kernel when the first CancelIoEx observed ERROR_NOT_FOUND.
+		if err := cancelWindowsIO(handle); err != nil {
 			return err
 		}
-		<-done
-		port.mu.Lock()
-		err = port.closeErr
-		port.mu.Unlock()
-		return err
+		if port.mu.TryLock() {
+			if port.handle == 0 {
+				return port.waitForConcurrentCloseLocked()
+			}
+			if port.handle != handle {
+				port.mu.Unlock()
+				continue
+			}
+			break
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf(
+				"cancel blocked serial I/O before close: timed out after %s",
+				closeIssueLockTimeout,
+			)
+		}
+		time.Sleep(closeIssueRetryDelay)
 	}
 
 	// Closing a handle does not reliably cancel an overlapped ReadFile on all
@@ -98,13 +135,7 @@ func (port *windowsPort) Close() error {
 	// keep the COM handle alive after Close returns to its caller. Cancel every
 	// operation issued by this process before closing so readers and writers on
 	// other Go-managed OS threads observe ERROR_OPERATION_ABORTED.
-	handle := port.handle
-	cancelErr := cancelPendingIO(handle, nil)
-	if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
-		// No operation was pending. This is the normal idle-close case.
-		cancelErr = nil
-	}
-	if cancelErr != nil {
+	if cancelErr := cancelWindowsIO(handle); cancelErr != nil {
 		// CancelIoEx does not guarantee that a failed cancellation completed any
 		// outstanding operation. Keep the handle, OVERLAPPED values, and caller
 		// buffers owned by the port and return promptly. A later Close retries the
@@ -115,6 +146,7 @@ func (port *windowsPort) Close() error {
 		return cancelErr
 	}
 	port.handle = 0
+	port.liveHandle.Store(0)
 	port.closeDone = make(chan struct{})
 	port.mu.Unlock()
 
@@ -134,6 +166,30 @@ func (port *windowsPort) Close() error {
 	return closeErr
 }
 
+func (port *windowsPort) waitForConcurrentCloseLocked() error {
+	done := port.closeDone
+	err := port.closeErr
+	port.mu.Unlock()
+	if done == nil {
+		return err
+	}
+	<-done
+	port.mu.Lock()
+	err = port.closeErr
+	port.mu.Unlock()
+	return err
+}
+
+func cancelWindowsIO(handle windows.Handle) error {
+	err := cancelPendingIO(handle, nil)
+	if errors.Is(err, windows.ERROR_NOT_FOUND) {
+		// No operation was pending. This is the normal idle-close case and can
+		// also occur in the pre-issuance window; Close retries before taking mu.
+		return nil
+	}
+	return err
+}
+
 func (port *windowsPort) Read(p []byte) (int, error) {
 	var readed uint32
 	ev, err := createOverlappedEvent()
@@ -144,7 +200,7 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 
 	for {
 		port.mu.Lock()
-		if port.handle == 0 {
+		if port.handle == 0 || port.closing.Load() {
 			port.mu.Unlock()
 			return 0, &PortError{code: PortClosed}
 		}
@@ -192,7 +248,7 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 	}
 	defer windows.CloseHandle(ev.HEvent)
 	port.mu.Lock()
-	if port.handle == 0 {
+	if port.handle == 0 || port.closing.Load() {
 		port.mu.Unlock()
 		return 0, &PortError{code: PortClosed}
 	}
@@ -500,6 +556,7 @@ func nativeOpen(portName string, mode *Mode) (*windowsPort, error) {
 	port := &windowsPort{
 		handle: handle,
 	}
+	port.liveHandle.Store(uintptr(handle))
 
 	// Set port parameters
 	params := &windows.DCB{}
