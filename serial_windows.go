@@ -73,7 +73,19 @@ func (port *windowsPort) Close() error {
 	if port.handle == 0 {
 		return nil
 	}
-	return windows.CloseHandle(port.handle)
+
+	// Closing a handle does not reliably cancel an overlapped ReadFile on all
+	// serial drivers. In particular, GetOverlappedResult may remain blocked and
+	// keep the COM handle alive after Close returns to its caller. Cancel every
+	// operation issued by this process before closing so readers and writers on
+	// other Go-managed OS threads observe ERROR_OPERATION_ABORTED.
+	cancelErr := windows.CancelIoEx(port.handle, nil)
+	if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
+		// No operation was pending. This is the normal idle-close case.
+		cancelErr = nil
+	}
+	closeErr := windows.CloseHandle(port.handle)
+	return errors.Join(cancelErr, closeErr)
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
