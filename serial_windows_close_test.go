@@ -15,6 +15,18 @@ import (
 func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	server, client := connectedOverlappedPipe(t)
 	port := &windowsPort{handle: server}
+	pending := make(chan struct{})
+	originalWait := waitForOverlappedResult
+	waitForOverlappedResult = func(
+		handle windows.Handle,
+		overlapped *windows.Overlapped,
+		transferred *uint32,
+		wait bool,
+	) error {
+		close(pending)
+		return originalWait(handle, overlapped, transferred, wait)
+	}
+	defer func() { waitForOverlappedResult = originalWait }()
 
 	readDone := make(chan error, 1)
 	go func() {
@@ -23,9 +35,13 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 		readDone <- err
 	}()
 
-	// The peer deliberately sends no data. Give ReadFile enough time to enter
-	// its pending GetOverlappedResult wait before closing from another goroutine.
-	time.Sleep(50 * time.Millisecond)
+	// The peer deliberately sends no data. Wait until ReadFile has explicitly
+	// reported ERROR_IO_PENDING before closing from another goroutine.
+	select {
+	case <-pending:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile did not enter the pending overlapped state")
+	}
 
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- port.Close() }()
