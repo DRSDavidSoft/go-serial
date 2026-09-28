@@ -85,27 +85,86 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 }
 
 func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
+	server, client := connectedOverlappedPipe(t)
+	port := &windowsPort{handle: server}
 	cancelErr := windows.ERROR_ACCESS_DENIED
 	closeErr := windows.ERROR_INVALID_FUNCTION
+	pending := make(chan struct{})
+	originalWait := waitForOverlappedResult
 	originalCancel := cancelPendingIO
 	originalClose := closeWindowsHandle
 	cancelCalls := 0
 	closeCalls := 0
+	waitForOverlappedResult = func(
+		handle windows.Handle,
+		overlapped *windows.Overlapped,
+		transferred *uint32,
+		wait bool,
+	) error {
+		close(pending)
+		return originalWait(handle, overlapped, transferred, wait)
+	}
 	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error {
 		cancelCalls++
 		return cancelErr
 	}
-	closeWindowsHandle = func(windows.Handle) error {
+	closeWindowsHandle = func(handle windows.Handle) error {
 		closeCalls++
-		return closeErr
+		return errors.Join(originalClose(handle), closeErr)
 	}
 	defer func() {
+		waitForOverlappedResult = originalWait
 		cancelPendingIO = originalCancel
 		closeWindowsHandle = originalClose
 	}()
 
-	port := &windowsPort{handle: windows.Handle(123)}
-	err := port.Close()
+	readDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 1)
+		_, err := port.Read(buffer)
+		readDone <- err
+	}()
+	select {
+	case <-pending:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile did not enter the pending overlapped state")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- port.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before failed-cancellation I/O completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Required: Close keeps the handle and OVERLAPPED storage alive.
+	}
+	if closeCalls != 0 {
+		t.Fatalf("CloseHandle calls before pending I/O completed = %d, want 0", closeCalls)
+	}
+
+	data := []byte{0xA5}
+	var written uint32
+	if err := windows.WriteFile(client, data, &written, nil); err != nil {
+		t.Fatalf("complete pending pipe read: %v", err)
+	}
+	if written != 1 {
+		t.Fatalf("pipe bytes written = %d, want 1", written)
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("completed read: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending read did not finish after peer completion")
+	}
+
+	var err error
+	select {
+	case err = <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after pending I/O completed")
+	}
 	if !errors.Is(err, cancelErr) || !errors.Is(err, closeErr) {
 		t.Fatalf("close error = %v, want joined cancellation and close errors", err)
 	}
@@ -117,6 +176,9 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 	}
 	if repeatedErr := port.Close(); repeatedErr != err {
 		t.Fatalf("repeated close error = %v, want stored result %v", repeatedErr, err)
+	}
+	if err := windows.CloseHandle(client); err != nil {
+		t.Fatalf("close pipe peer: %v", err)
 	}
 }
 

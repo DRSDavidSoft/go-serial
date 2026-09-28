@@ -109,6 +109,8 @@ func (port *windowsPort) Close() error {
 	// kernel handle before every in-flight ReadFile/WriteFile has returned. This
 	// wait is also required when cancellation reports an unexpected error: the
 	// alternative would invalidate memory still owned by an active operation.
+	// A broken driver may therefore keep Close blocked; preserving the handle,
+	// OVERLAPPED value, and caller buffer is safer than reporting a false close.
 	port.pendingIO.Wait()
 	closeErr := closeWindowsHandle(handle)
 	result := errors.Join(cancelErr, closeErr)
