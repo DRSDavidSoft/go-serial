@@ -19,6 +19,7 @@ package serial
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +40,7 @@ type windowsPort struct {
 
 var (
 	waitForOverlappedResult = windows.GetOverlappedResult
+	waitForOverlappedEvent  = windows.WaitForSingleObject
 	cancelPendingIO         = windows.CancelIoEx
 	closeWindowsHandle      = windows.CloseHandle
 	readWindowsFile         = windows.ReadFile
@@ -148,30 +150,14 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 		}
 		handle := port.handle
 		port.pendingIO.Add(1)
-		port.mu.Unlock()
-		// Some USB serial drivers can block inside ReadFile even for a handle
-		// opened with FILE_FLAG_OVERLAPPED. Never hold mu across the kernel call:
-		// Close must be able to reach CancelIoEx while that call is in progress.
+		// Keep mu through documented-overlapped issuance so Close cannot observe
+		// ERROR_NOT_FOUND, close the handle, and let its numeric value be reused
+		// before this syscall starts. The potentially blocking completion wait is
+		// event-based below and runs without mu.
 		err = readWindowsFile(handle, p, &readed, ev)
-		var issueCancelErr error
+		port.mu.Unlock()
 		if err == windows.ERROR_IO_PENDING {
-			// Close can win after this operation was registered but just before
-			// ReadFile issued it. In that narrow race the first CancelIoEx reports
-			// ERROR_NOT_FOUND. Once ReadFile returns IO_PENDING, cancel this exact
-			// OVERLAPPED so Close's pendingIO wait cannot strand the handle.
-			port.mu.Lock()
-			closing := port.handle == 0
-			port.mu.Unlock()
-			if closing {
-				cancelErr := cancelPendingIO(handle, ev)
-				if cancelErr != nil && !errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
-					issueCancelErr = cancelErr
-				}
-			}
-			err = waitForOverlappedResult(handle, ev, &readed, true)
-		}
-		if issueCancelErr != nil {
-			err = errors.Join(issueCancelErr, err)
+			err = port.waitOverlapped(handle, ev, &readed)
 		}
 		port.pendingIO.Done()
 		switch err {
@@ -212,28 +198,39 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 	}
 	handle := port.handle
 	port.pendingIO.Add(1)
-	port.mu.Unlock()
-	// Keep Close able to call CancelIoEx even if a driver blocks in WriteFile.
 	err = writeWindowsFile(handle, p, &writed, ev)
-	var issueCancelErr error
+	port.mu.Unlock()
 	if err == windows.ERROR_IO_PENDING {
-		port.mu.Lock()
-		closing := port.handle == 0
-		port.mu.Unlock()
-		if closing {
-			cancelErr := cancelPendingIO(handle, ev)
-			if cancelErr != nil && !errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
-				issueCancelErr = cancelErr
-			}
-		}
 		// wait for write to complete
-		err = waitForOverlappedResult(handle, ev, &writed, true)
-	}
-	if issueCancelErr != nil {
-		err = errors.Join(issueCancelErr, err)
+		err = port.waitOverlapped(handle, ev, &writed)
 	}
 	port.pendingIO.Done()
 	return int(writed), windowsIOError(err)
+}
+
+func (port *windowsPort) waitOverlapped(
+	handle windows.Handle,
+	overlapped *windows.Overlapped,
+	transferred *uint32,
+) error {
+	result, err := waitForOverlappedEvent(overlapped.HEvent, windows.INFINITE)
+	if err != nil {
+		return err
+	}
+	if result != windows.WAIT_OBJECT_0 {
+		return fmt.Errorf("wait for overlapped serial operation returned 0x%X", result)
+	}
+
+	// CloseHandle may have completed cancellation and made the captured numeric
+	// handle available for reuse. Never call a post-close API with that value.
+	// The per-operation event is the lifetime authority; after it signals, only
+	// query the result while mu proves this is still the live port handle.
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if port.handle != handle {
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	return waitForOverlappedResult(handle, overlapped, transferred, false)
 }
 
 func windowsIOError(err error) error {
