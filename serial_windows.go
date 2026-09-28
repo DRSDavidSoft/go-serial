@@ -32,7 +32,16 @@ type windowsPort struct {
 	mu         sync.Mutex
 	handle     windows.Handle
 	hasTimeout bool
+	pendingIO  sync.WaitGroup
+	closeDone  chan struct{}
+	closeErr   error
 }
+
+var (
+	waitForOverlappedResult = windows.GetOverlappedResult
+	cancelPendingIO         = windows.CancelIoEx
+	closeWindowsHandle      = windows.CloseHandle
+)
 
 func nativeGetPortsList() ([]string, error) {
 	key, err := registry.OpenKey(windows.HKEY_LOCAL_MACHINE, `HARDWARE\DEVICEMAP\SERIALCOMM\`, windows.KEY_READ)
@@ -66,14 +75,49 @@ func nativeGetPortsList() ([]string, error) {
 
 func (port *windowsPort) Close() error {
 	port.mu.Lock()
-	defer func() {
-		port.handle = 0
-		port.mu.Unlock()
-	}()
 	if port.handle == 0 {
-		return nil
+		done := port.closeDone
+		err := port.closeErr
+		port.mu.Unlock()
+		if done == nil {
+			return err
+		}
+		<-done
+		port.mu.Lock()
+		err = port.closeErr
+		port.mu.Unlock()
+		return err
 	}
-	return windows.CloseHandle(port.handle)
+
+	// Closing a handle does not reliably cancel an overlapped ReadFile on all
+	// serial drivers. In particular, GetOverlappedResult may remain blocked and
+	// keep the COM handle alive after Close returns to its caller. Cancel every
+	// operation issued by this process before closing so readers and writers on
+	// other Go-managed OS threads observe ERROR_OPERATION_ABORTED.
+	handle := port.handle
+	cancelErr := cancelPendingIO(handle, nil)
+	if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
+		// No operation was pending. This is the normal idle-close case.
+		cancelErr = nil
+	}
+	port.handle = 0
+	port.closeDone = make(chan struct{})
+	port.mu.Unlock()
+
+	// CancelIoEx only requests cancellation. The OVERLAPPED structures must
+	// stay alive until their waiters observe completion, so do not release the
+	// kernel handle before every in-flight ReadFile/WriteFile has returned. This
+	// wait is also required when cancellation reports an unexpected error: the
+	// alternative would invalidate memory still owned by an active operation.
+	port.pendingIO.Wait()
+	closeErr := closeWindowsHandle(handle)
+	result := errors.Join(cancelErr, closeErr)
+
+	port.mu.Lock()
+	port.closeErr = result
+	close(port.closeDone)
+	port.mu.Unlock()
+	return result
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
@@ -85,16 +129,25 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 	defer windows.CloseHandle(ev.HEvent)
 
 	for {
-		err = windows.ReadFile(port.handle, p, &readed, ev)
-		if err == windows.ERROR_IO_PENDING {
-			err = windows.GetOverlappedResult(port.handle, ev, &readed, true)
+		port.mu.Lock()
+		if port.handle == 0 {
+			port.mu.Unlock()
+			return 0, &PortError{code: PortClosed}
 		}
+		handle := port.handle
+		port.pendingIO.Add(1)
+		err = windows.ReadFile(handle, p, &readed, ev)
+		port.mu.Unlock()
+		if err == windows.ERROR_IO_PENDING {
+			err = waitForOverlappedResult(handle, ev, &readed, true)
+		}
+		port.pendingIO.Done()
 		switch err {
 		case nil:
 			// operation completed successfully
 		case windows.ERROR_OPERATION_ABORTED:
 			// port may have been closed
-			return int(readed), &PortError{code: PortClosed, causedBy: err}
+			return int(readed), windowsIOError(err)
 		default:
 			// error happened
 			return int(readed), err
@@ -120,12 +173,28 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	defer windows.CloseHandle(ev.HEvent)
-	err = windows.WriteFile(port.handle, p, &writed, ev)
+	port.mu.Lock()
+	if port.handle == 0 {
+		port.mu.Unlock()
+		return 0, &PortError{code: PortClosed}
+	}
+	handle := port.handle
+	port.pendingIO.Add(1)
+	err = windows.WriteFile(handle, p, &writed, ev)
+	port.mu.Unlock()
 	if err == windows.ERROR_IO_PENDING {
 		// wait for write to complete
-		err = windows.GetOverlappedResult(port.handle, ev, &writed, true)
+		err = waitForOverlappedResult(handle, ev, &writed, true)
 	}
-	return int(writed), err
+	port.pendingIO.Done()
+	return int(writed), windowsIOError(err)
+}
+
+func windowsIOError(err error) error {
+	if errors.Is(err, windows.ERROR_OPERATION_ABORTED) {
+		return &PortError{code: PortClosed, causedBy: err}
+	}
+	return err
 }
 
 func (port *windowsPort) Drain() (err error) {
