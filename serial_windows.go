@@ -100,28 +100,24 @@ func (port *windowsPort) Close() error {
 		// No operation was pending. This is the normal idle-close case.
 		cancelErr = nil
 	}
-	if cancelErr != nil {
-		// Cancellation failure means an OVERLAPPED structure may still be in use.
-		// Keep the handle open so CloseHandle cannot invalidate it underneath the
-		// waiter, and allow a later Close call to retry cancellation safely.
-		port.mu.Unlock()
-		return cancelErr
-	}
 	port.handle = 0
 	port.closeDone = make(chan struct{})
 	port.mu.Unlock()
 
 	// CancelIoEx only requests cancellation. The OVERLAPPED structures must
 	// stay alive until their waiters observe completion, so do not release the
-	// kernel handle before every in-flight ReadFile/WriteFile has returned.
+	// kernel handle before every in-flight ReadFile/WriteFile has returned. This
+	// wait is also required when cancellation reports an unexpected error: the
+	// alternative would invalidate memory still owned by an active operation.
 	port.pendingIO.Wait()
 	closeErr := closeWindowsHandle(handle)
+	result := errors.Join(cancelErr, closeErr)
 
 	port.mu.Lock()
-	port.closeErr = closeErr
+	port.closeErr = result
 	close(port.closeDone)
 	port.mu.Unlock()
-	return closeErr
+	return result
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
