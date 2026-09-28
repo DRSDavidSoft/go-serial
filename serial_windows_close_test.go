@@ -84,20 +84,22 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	}
 }
 
-func TestWindowsCloseAttemptsHandleReleaseWhenCancellationFails(t *testing.T) {
+func TestWindowsClosePreservesHandleForRetryWhenCancellationFails(t *testing.T) {
 	cancelErr := windows.ERROR_ACCESS_DENIED
-	closeErr := windows.ERROR_INVALID_FUNCTION
 	originalCancel := cancelPendingIO
 	originalClose := closeWindowsHandle
 	cancelCalls := 0
 	closeCalls := 0
 	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error {
 		cancelCalls++
-		return cancelErr
+		if cancelCalls == 1 {
+			return cancelErr
+		}
+		return nil
 	}
 	closeWindowsHandle = func(windows.Handle) error {
 		closeCalls++
-		return closeErr
+		return nil
 	}
 	defer func() {
 		cancelPendingIO = originalCancel
@@ -106,17 +108,24 @@ func TestWindowsCloseAttemptsHandleReleaseWhenCancellationFails(t *testing.T) {
 
 	port := &windowsPort{handle: windows.Handle(123)}
 	err := port.Close()
-	if !errors.Is(err, cancelErr) || !errors.Is(err, closeErr) {
-		t.Fatalf("close error = %v, want joined cancellation and close errors", err)
+	if !errors.Is(err, cancelErr) {
+		t.Fatalf("close error = %v, want cancellation error %v", err, cancelErr)
 	}
-	if cancelCalls != 1 || closeCalls != 1 {
-		t.Fatalf("calls = cancel %d, close %d; want one each", cancelCalls, closeCalls)
+	if cancelCalls != 1 || closeCalls != 0 {
+		t.Fatalf("calls after failed cancellation = cancel %d, close %d; want 1, 0", cancelCalls, closeCalls)
+	}
+	if port.handle == 0 {
+		t.Fatal("cancellation failure invalidated a handle that may still have pending I/O")
+	}
+
+	if retryErr := port.Close(); retryErr != nil {
+		t.Fatalf("retry close: %v", retryErr)
+	}
+	if cancelCalls != 2 || closeCalls != 1 {
+		t.Fatalf("calls after retry = cancel %d, close %d; want 2, 1", cancelCalls, closeCalls)
 	}
 	if port.handle != 0 {
-		t.Fatalf("handle = %v after close failure, want 0", port.handle)
-	}
-	if repeatedErr := port.Close(); repeatedErr != err {
-		t.Fatalf("repeated close error = %v, want stored result %v", repeatedErr, err)
+		t.Fatalf("handle = %v after successful retry, want 0", port.handle)
 	}
 }
 

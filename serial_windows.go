@@ -95,32 +95,33 @@ func (port *windowsPort) Close() error {
 	// operation issued by this process before closing so readers and writers on
 	// other Go-managed OS threads observe ERROR_OPERATION_ABORTED.
 	handle := port.handle
-	port.handle = 0
-	port.closeDone = make(chan struct{})
 	cancelErr := cancelPendingIO(handle, nil)
 	if errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
 		// No operation was pending. This is the normal idle-close case.
 		cancelErr = nil
 	}
+	if cancelErr != nil {
+		// Cancellation failure means an OVERLAPPED structure may still be in use.
+		// Keep the handle open so CloseHandle cannot invalidate it underneath the
+		// waiter, and allow a later Close call to retry cancellation safely.
+		port.mu.Unlock()
+		return cancelErr
+	}
+	port.handle = 0
+	port.closeDone = make(chan struct{})
 	port.mu.Unlock()
 
-	if cancelErr == nil {
-		// CancelIoEx only requests cancellation. The OVERLAPPED structures must
-		// stay alive until their waiters observe completion, so do not release the
-		// kernel handle before every in-flight ReadFile/WriteFile has returned.
-		port.pendingIO.Wait()
-	}
-	// If cancellation itself failed, waiting could block forever because the
-	// driver may never complete the operation. CloseHandle is still mandatory:
-	// it is the final release attempt, and both errors are returned to the caller.
+	// CancelIoEx only requests cancellation. The OVERLAPPED structures must
+	// stay alive until their waiters observe completion, so do not release the
+	// kernel handle before every in-flight ReadFile/WriteFile has returned.
+	port.pendingIO.Wait()
 	closeErr := closeWindowsHandle(handle)
-	result := errors.Join(cancelErr, closeErr)
 
 	port.mu.Lock()
-	port.closeErr = result
+	port.closeErr = closeErr
 	close(port.closeDone)
 	port.mu.Unlock()
-	return result
+	return closeErr
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
