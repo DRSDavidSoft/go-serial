@@ -85,6 +85,212 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	}
 }
 
+func TestWindowsCloseReleasesHandleBeforeJoiningDriverCancellation(t *testing.T) {
+	port := &windowsPort{handle: windows.Handle(1)}
+	readStarted := make(chan struct{})
+	handleClosed := make(chan struct{})
+	originalRead := readWindowsFile
+	originalWait := waitForOverlappedResult
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	readWindowsFile = func(
+		windows.Handle,
+		[]byte,
+		*uint32,
+		*windows.Overlapped,
+	) error {
+		close(readStarted)
+		return windows.ERROR_IO_PENDING
+	}
+	waitForOverlappedResult = func(
+		windows.Handle,
+		*windows.Overlapped,
+		*uint32,
+		bool,
+	) error {
+		// Model the CH340 behavior observed on Cafe: CancelIoEx is accepted,
+		// but completion is not delivered until CloseHandle releases the device.
+		<-handleClosed
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error { return nil }
+	closeWindowsHandle = func(windows.Handle) error {
+		close(handleClosed)
+		return nil
+	}
+	defer func() {
+		readWindowsFile = originalRead
+		waitForOverlappedResult = originalWait
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := port.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile was not issued")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- port.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close waited for driver completion before releasing the handle")
+	}
+	select {
+	case err := <-readDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("read error = %v, want PortClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read did not finish after handle release")
+	}
+}
+
+func TestWindowsCloseCanCancelDriverBlockedInsideReadFile(t *testing.T) {
+	port := &windowsPort{handle: windows.Handle(1)}
+	readStarted := make(chan struct{})
+	canceled := make(chan struct{})
+	originalRead := readWindowsFile
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	readWindowsFile = func(
+		windows.Handle,
+		[]byte,
+		*uint32,
+		*windows.Overlapped,
+	) error {
+		close(readStarted)
+		<-canceled
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error {
+		close(canceled)
+		return nil
+	}
+	closeWindowsHandle = func(windows.Handle) error { return nil }
+	defer func() {
+		readWindowsFile = originalRead
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := port.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile was not entered")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- port.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close could not reach CancelIoEx while ReadFile was blocked")
+	}
+	select {
+	case err := <-readDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("read error = %v, want PortClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked ReadFile was not canceled")
+	}
+}
+
+func TestWindowsCloseCancelsOperationIssuedAfterInitialCancel(t *testing.T) {
+	port := &windowsPort{handle: windows.Handle(1)}
+	readEntered := make(chan struct{})
+	initialCancel := make(chan struct{})
+	targetedCancel := make(chan struct{})
+	originalRead := readWindowsFile
+	originalWait := waitForOverlappedResult
+	originalCancel := cancelPendingIO
+	originalClose := closeWindowsHandle
+	readWindowsFile = func(
+		windows.Handle,
+		[]byte,
+		*uint32,
+		*windows.Overlapped,
+	) error {
+		close(readEntered)
+		<-initialCancel
+		return windows.ERROR_IO_PENDING
+	}
+	waitForOverlappedResult = func(
+		windows.Handle,
+		*windows.Overlapped,
+		*uint32,
+		bool,
+	) error {
+		<-targetedCancel
+		return windows.ERROR_OPERATION_ABORTED
+	}
+	cancelPendingIO = func(_ windows.Handle, overlapped *windows.Overlapped) error {
+		if overlapped == nil {
+			close(initialCancel)
+			return windows.ERROR_NOT_FOUND
+		}
+		close(targetedCancel)
+		return nil
+	}
+	closeWindowsHandle = func(windows.Handle) error { return nil }
+	defer func() {
+		readWindowsFile = originalRead
+		waitForOverlappedResult = originalWait
+		cancelPendingIO = originalCancel
+		closeWindowsHandle = originalClose
+	}()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := port.Read(make([]byte, 1))
+		readDone <- err
+	}()
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ReadFile was not entered")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- port.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close stranded an operation issued after the initial CancelIoEx")
+	}
+	select {
+	case err := <-readDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("read error = %v, want PortClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late-issued read was not canceled")
+	}
+}
+
 func TestWindowsCloseReturnsCancellationErrorAndLaterCloseRetries(t *testing.T) {
 	server, client := connectedOverlappedPipe(t)
 	port := &windowsPort{handle: server}

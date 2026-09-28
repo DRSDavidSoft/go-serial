@@ -41,6 +41,8 @@ var (
 	waitForOverlappedResult = windows.GetOverlappedResult
 	cancelPendingIO         = windows.CancelIoEx
 	closeWindowsHandle      = windows.CloseHandle
+	readWindowsFile         = windows.ReadFile
+	writeWindowsFile        = windows.WriteFile
 )
 
 func nativeGetPortsList() ([]string, error) {
@@ -114,14 +116,14 @@ func (port *windowsPort) Close() error {
 	port.closeDone = make(chan struct{})
 	port.mu.Unlock()
 
-	// CancelIoEx only requests cancellation. The OVERLAPPED structures must
-	// stay alive until their waiters observe completion, so do not release the
-	// kernel handle before every in-flight ReadFile/WriteFile has returned. This
-	// wait is required after cancellation was accepted: CancelIoEx only queues
-	// cancellation and the operation owns its OVERLAPPED and caller buffer until
-	// its waiter observes completion.
-	port.pendingIO.Wait()
+	// CancelIoEx only requests cancellation. Some USB serial drivers do not
+	// complete their pending OVERLAPPED operation until the file handle itself
+	// is closed, so release the handle before joining the waiters. Read/Write keep
+	// their OVERLAPPED values and caller buffers alive until pendingIO reaches
+	// zero, preserving the Windows lifetime contract while allowing those drivers
+	// to finish cancellation.
 	closeErr := closeWindowsHandle(handle)
+	port.pendingIO.Wait()
 
 	port.mu.Lock()
 	port.closeErr = closeErr
@@ -146,10 +148,30 @@ func (port *windowsPort) Read(p []byte) (int, error) {
 		}
 		handle := port.handle
 		port.pendingIO.Add(1)
-		err = windows.ReadFile(handle, p, &readed, ev)
 		port.mu.Unlock()
+		// Some USB serial drivers can block inside ReadFile even for a handle
+		// opened with FILE_FLAG_OVERLAPPED. Never hold mu across the kernel call:
+		// Close must be able to reach CancelIoEx while that call is in progress.
+		err = readWindowsFile(handle, p, &readed, ev)
+		var issueCancelErr error
 		if err == windows.ERROR_IO_PENDING {
+			// Close can win after this operation was registered but just before
+			// ReadFile issued it. In that narrow race the first CancelIoEx reports
+			// ERROR_NOT_FOUND. Once ReadFile returns IO_PENDING, cancel this exact
+			// OVERLAPPED so Close's pendingIO wait cannot strand the handle.
+			port.mu.Lock()
+			closing := port.handle == 0
+			port.mu.Unlock()
+			if closing {
+				cancelErr := cancelPendingIO(handle, ev)
+				if cancelErr != nil && !errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
+					issueCancelErr = cancelErr
+				}
+			}
 			err = waitForOverlappedResult(handle, ev, &readed, true)
+		}
+		if issueCancelErr != nil {
+			err = errors.Join(issueCancelErr, err)
 		}
 		port.pendingIO.Done()
 		switch err {
@@ -190,11 +212,25 @@ func (port *windowsPort) Write(p []byte) (int, error) {
 	}
 	handle := port.handle
 	port.pendingIO.Add(1)
-	err = windows.WriteFile(handle, p, &writed, ev)
 	port.mu.Unlock()
+	// Keep Close able to call CancelIoEx even if a driver blocks in WriteFile.
+	err = writeWindowsFile(handle, p, &writed, ev)
+	var issueCancelErr error
 	if err == windows.ERROR_IO_PENDING {
+		port.mu.Lock()
+		closing := port.handle == 0
+		port.mu.Unlock()
+		if closing {
+			cancelErr := cancelPendingIO(handle, ev)
+			if cancelErr != nil && !errors.Is(cancelErr, windows.ERROR_NOT_FOUND) {
+				issueCancelErr = cancelErr
+			}
+		}
 		// wait for write to complete
 		err = waitForOverlappedResult(handle, ev, &writed, true)
+	}
+	if issueCancelErr != nil {
+		err = errors.Join(issueCancelErr, err)
 	}
 	port.pendingIO.Done()
 	return int(writed), windowsIOError(err)
