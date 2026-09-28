@@ -85,19 +85,16 @@ func TestWindowsCloseCancelsPendingOverlappedRead(t *testing.T) {
 	}
 }
 
-func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
+func TestWindowsCloseReturnsCancellationErrorAndLaterCloseRetries(t *testing.T) {
 	server, client := connectedOverlappedPipe(t)
 	port := &windowsPort{handle: server}
 	cancelErr := windows.ERROR_ACCESS_DENIED
-	closeErr := windows.ERROR_INVALID_FUNCTION
 	pending := make(chan struct{})
 	originalWait := waitForOverlappedResult
 	originalCancel := cancelPendingIO
 	originalClose := closeWindowsHandle
-	originalBeforeWait := beforePendingIOWait
 	cancelCalls := 0
 	var closeCalls atomic.Int32
-	waitingForIO := make(chan struct{})
 	waitForOverlappedResult = func(
 		handle windows.Handle,
 		overlapped *windows.Overlapped,
@@ -107,20 +104,21 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 		close(pending)
 		return originalWait(handle, overlapped, transferred, wait)
 	}
-	cancelPendingIO = func(windows.Handle, *windows.Overlapped) error {
+	cancelPendingIO = func(handle windows.Handle, overlapped *windows.Overlapped) error {
 		cancelCalls++
-		return cancelErr
+		if cancelCalls == 1 {
+			return cancelErr
+		}
+		return originalCancel(handle, overlapped)
 	}
 	closeWindowsHandle = func(handle windows.Handle) error {
 		closeCalls.Add(1)
-		return errors.Join(originalClose(handle), closeErr)
+		return originalClose(handle)
 	}
-	beforePendingIOWait = func() { close(waitingForIO) }
 	defer func() {
 		waitForOverlappedResult = originalWait
 		cancelPendingIO = originalCancel
 		closeWindowsHandle = originalClose
-		beforePendingIOWait = originalBeforeWait
 	}()
 
 	readDone := make(chan error, 1)
@@ -138,53 +136,67 @@ func TestWindowsCloseWaitsAndReleasesHandleWhenCancellationFails(t *testing.T) {
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- port.Close() }()
 	select {
-	case <-waitingForIO:
-	case <-time.After(time.Second):
-		t.Fatal("Close did not reach the pending-I/O lifetime wait")
-	}
-	select {
 	case err := <-closeDone:
-		t.Fatalf("Close returned before failed-cancellation I/O completed: %v", err)
-	default:
+		if !errors.Is(err, cancelErr) {
+			t.Fatalf("first Close error = %v, want cancellation error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Close did not return after cancellation failed")
 	}
 	if calls := closeCalls.Load(); calls != 0 {
-		t.Fatalf("CloseHandle calls before pending I/O completed = %d, want 0", calls)
+		t.Fatalf("CloseHandle calls after failed cancellation = %d, want 0", calls)
 	}
-
-	data := []byte{0xA5}
-	var written uint32
-	if err := windows.WriteFile(client, data, &written, nil); err != nil {
-		t.Fatalf("complete pending pipe read: %v", err)
-	}
-	if written != 1 {
-		t.Fatalf("pipe bytes written = %d, want 1", written)
+	if port.handle != server {
+		t.Fatalf("handle = %v after failed cancellation, want retained %v", port.handle, server)
 	}
 	select {
 	case err := <-readDone:
-		if err != nil {
-			t.Fatalf("completed read: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("pending read did not finish after peer completion")
+		t.Fatalf("pending read returned after failed cancellation: %v", err)
+	default:
 	}
 
-	var err error
+	var duplicate windows.Handle
+	if err := windows.DuplicateHandle(
+		windows.CurrentProcess(), server,
+		windows.CurrentProcess(), &duplicate,
+		0, false, windows.DUPLICATE_SAME_ACCESS,
+	); err != nil {
+		t.Fatalf("duplicate retained serial handle: %v", err)
+	}
+	if err := windows.CloseHandle(duplicate); err != nil {
+		t.Fatalf("close duplicate retained handle: %v", err)
+	}
+
+	// A later Close retries cancellation. This time the real CancelIoEx runs,
+	// the waiter observes ERROR_OPERATION_ABORTED, and only then is the handle
+	// released.
+	go func() { closeDone <- port.Close() }()
 	select {
-	case err = <-closeDone:
+	case err := <-readDone:
+		var portErr *PortError
+		if !errors.As(err, &portErr) || portErr.Code() != PortClosed {
+			t.Fatalf("read error = %v, want PortClosed", err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("Close did not finish after pending I/O completed")
+		t.Fatal("pending read did not return after retrying Close")
 	}
-	if !errors.Is(err, cancelErr) || !errors.Is(err, closeErr) {
-		t.Fatalf("close error = %v, want joined cancellation and close errors", err)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("retry Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry Close did not finish after cancellation succeeded")
 	}
-	if calls := closeCalls.Load(); cancelCalls != 1 || calls != 1 {
-		t.Fatalf("calls = cancel %d, close %d; want one each", cancelCalls, calls)
+	if calls := closeCalls.Load(); cancelCalls != 2 || calls != 1 {
+		t.Fatalf("calls = cancel %d, close %d; want two cancellations and one close", cancelCalls, calls)
 	}
 	if port.handle != 0 {
 		t.Fatalf("handle = %v after completed close, want 0", port.handle)
 	}
-	if repeatedErr := port.Close(); repeatedErr != err {
-		t.Fatalf("repeated close error = %v, want stored result %v", repeatedErr, err)
+	if repeatedErr := port.Close(); repeatedErr != nil {
+		t.Fatalf("repeated Close after successful retry = %v, want nil", repeatedErr)
 	}
 	if err := windows.CloseHandle(client); err != nil {
 		t.Fatalf("close pipe peer: %v", err)

@@ -41,7 +41,6 @@ var (
 	waitForOverlappedResult = windows.GetOverlappedResult
 	cancelPendingIO         = windows.CancelIoEx
 	closeWindowsHandle      = windows.CloseHandle
-	beforePendingIOWait     = func() {}
 )
 
 func nativeGetPortsList() ([]string, error) {
@@ -101,6 +100,16 @@ func (port *windowsPort) Close() error {
 		// No operation was pending. This is the normal idle-close case.
 		cancelErr = nil
 	}
+	if cancelErr != nil {
+		// CancelIoEx does not guarantee that a failed cancellation completed any
+		// outstanding operation. Keep the handle, OVERLAPPED values, and caller
+		// buffers owned by the port and return promptly. A later Close retries the
+		// cancellation. Closing the handle or returning while a background reaper
+		// owns those caller buffers would violate the Windows overlapped-I/O
+		// lifetime contract.
+		port.mu.Unlock()
+		return cancelErr
+	}
 	port.handle = 0
 	port.closeDone = make(chan struct{})
 	port.mu.Unlock()
@@ -108,20 +117,17 @@ func (port *windowsPort) Close() error {
 	// CancelIoEx only requests cancellation. The OVERLAPPED structures must
 	// stay alive until their waiters observe completion, so do not release the
 	// kernel handle before every in-flight ReadFile/WriteFile has returned. This
-	// wait is also required when cancellation reports an unexpected error: the
-	// alternative would invalidate memory still owned by an active operation.
-	// A broken driver may therefore keep Close blocked; preserving the handle,
-	// OVERLAPPED value, and caller buffer is safer than reporting a false close.
-	beforePendingIOWait()
+	// wait is required after cancellation was accepted: CancelIoEx only queues
+	// cancellation and the operation owns its OVERLAPPED and caller buffer until
+	// its waiter observes completion.
 	port.pendingIO.Wait()
 	closeErr := closeWindowsHandle(handle)
-	result := errors.Join(cancelErr, closeErr)
 
 	port.mu.Lock()
-	port.closeErr = result
+	port.closeErr = closeErr
 	close(port.closeDone)
 	port.mu.Unlock()
-	return result
+	return closeErr
 }
 
 func (port *windowsPort) Read(p []byte) (int, error) {
