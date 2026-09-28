@@ -41,6 +41,7 @@ var (
 	waitForOverlappedResult = windows.GetOverlappedResult
 	cancelPendingIO         = windows.CancelIoEx
 	closeWindowsHandle      = windows.CloseHandle
+	beforePendingIOWait     = func() {}
 )
 
 func nativeGetPortsList() ([]string, error) {
@@ -109,6 +110,9 @@ func (port *windowsPort) Close() error {
 	// kernel handle before every in-flight ReadFile/WriteFile has returned. This
 	// wait is also required when cancellation reports an unexpected error: the
 	// alternative would invalidate memory still owned by an active operation.
+	// A broken driver may therefore keep Close blocked; preserving the handle,
+	// OVERLAPPED value, and caller buffer is safer than reporting a false close.
+	beforePendingIOWait()
 	port.pendingIO.Wait()
 	closeErr := closeWindowsHandle(handle)
 	result := errors.Join(cancelErr, closeErr)
